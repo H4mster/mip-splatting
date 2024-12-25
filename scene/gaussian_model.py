@@ -20,6 +20,8 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.pose_utils import rotation2quad, get_tensor_from_camera
+from scene.per_point_adam import PerPointAdam
 
 class GaussianModel:
 
@@ -72,6 +74,7 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.P,
         )
     
     def restore(self, model_args, training_args):
@@ -86,7 +89,8 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self.P) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -139,6 +143,18 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
+    def init_RT_seq(self, cam_list):
+        poses =[]
+        for cam in cam_list[1.0]:
+            p = get_tensor_from_camera(cam.world_view_transform.transpose(0, 1)) # R T -> quat t
+            poses.append(p)
+        poses = torch.stack(poses)
+        self.P = poses.cuda().requires_grad_(True)
+
+    def get_RT(self, idx):
+        pose = self.P[idx]
+        return pose
+
     @torch.no_grad()
     def compute_3D_filter(self, cameras):
         print("Computing 3D filter")
@@ -150,7 +166,6 @@ class GaussianModel:
         # we should use the focal length of the highest resolution camera
         focal_length = 0.
         for camera in cameras:
-
             # transform points to camera space
             R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
             T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
@@ -226,6 +241,7 @@ class GaussianModel:
         self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -235,19 +251,33 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        l_cam = [{'params': [self.P],'lr': training_args.rotation_lr * 0.01, "name": "pose"},]
+        l += l_cam
+
+        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizer = PerPointAdam(l, lr=0, betas=(0.9, 0.999), eps=1e-15, weight_decay=0.0)
+
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        self.cam_scheduler_args = get_expon_lr_func(
+                                                    lr_init=training_args.rotation_lr * 0.1,
+                                                    lr_final=training_args.rotation_lr * 0.001,
+                                                    lr_delay_mult=training_args.position_lr_delay_mult,
+                                                    max_steps=training_args.iterations)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "pose":
+                lr = self.cam_scheduler_args(iteration)
+                # print("pose learning rate", iteration, lr)
+                param_group['lr'] = lr
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
+                # return lr
 
     def construct_list_of_attributes(self, exclude_filter=False):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -376,6 +406,8 @@ class GaussianModel:
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] == "pose":
+                continue
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
@@ -391,6 +423,8 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if group["name"] == "pose":
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -427,6 +461,8 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
+            if group["name"] == "pose":
+                continue
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:

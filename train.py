@@ -57,7 +57,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    bg_color = [1, 1, 1] if dataset.white_background else [102 / 255, 102 / 255, 102 / 255]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -106,7 +106,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_indices = list(range(len(viewpoint_stack)))
+        rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        vind = viewpoint_indices.pop(rand_idx)
+        pose = gaussians.get_RT(viewpoint_cam.uid)
         
         # Pick a random high resolution camera
         if random.random() < 0.3 and dataset.sample_more_highres:
@@ -122,8 +126,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # subpixel_offset *= 0.0
         else:
             subpixel_offset = None
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background,
+                            kernel_size=dataset.kernel_size,
+                            subpixel_offset=subpixel_offset,
+                            camera_pose=pose,
+                            update_pose=iteration < opt.update_pose_until_iter)
+        image, viewspace_point_tensor, visibility_filter, radii \
+            = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -136,6 +145,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
         iter_end.record()
+        if iteration % 100 == 0:
+            for param_group in gaussians.optimizer.param_groups:
+                for param in param_group['params']:
+                    if param is gaussians.P:
+                        print(viewpoint_cam.uid, param.grad)
+                        break
 
         with torch.no_grad():
             # Progress bar
@@ -147,7 +162,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
+            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
