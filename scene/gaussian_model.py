@@ -96,6 +96,23 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    def restore(self, model_args):
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
+        self._features_rest,
+        self._scaling,
+        self._rotation,
+        self._opacity,
+        self.max_radii2D,
+        xyz_gradient_accum,
+        denom,
+        opt_dict,
+        self.spatial_lr_scale,
+        self.P) = model_args
+        self.xyz_gradient_accum = xyz_gradient_accum
+        self.denom = denom
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -148,8 +165,26 @@ class GaussianModel:
         for cam in cam_list[1.0]:
             p = get_tensor_from_camera(cam.world_view_transform.transpose(0, 1)) # R T -> quat t
             poses.append(p)
+            # 验证
+            # from utils.pose_utils import get_camera_from_tensor
+            # w2c = get_camera_from_tensor(p)
+            # def reWorldViewTransform(world_view_transform, scale):
+            #     world_view_transform = world_view_transform
+            #
+            #     R = world_view_transform[:3, :3]
+            #     T = world_view_transform[:3, 3]
+            #     T = T / scale
+            #
+            #     R = R.transpose(0, 1)
+            #
+            #     return R, T
+            #
+            # R, t = reWorldViewTransform(w2c, 1.0)
+            # print(np.all((R.cpu().numpy() - cam.R) < 1e-7))
+            # print(np.all((t.cpu().numpy() - cam.T) < 1e-7))
         poses = torch.stack(poses)
         self.P = poses.cuda().requires_grad_(True)
+        self.oriP = self.P.clone().detach()
 
     def get_RT(self, idx):
         pose = self.P[idx]
@@ -167,8 +202,24 @@ class GaussianModel:
         focal_length = 0.
         for camera in cameras:
             # transform points to camera space
-            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
-            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
+            # R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
+            # T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
+
+            from utils.pose_utils import get_camera_from_tensor
+            w2c = get_camera_from_tensor(self.get_RT(camera.uid))
+            def reWorldViewTransform(world_view_transform, scale):
+                world_view_transform = world_view_transform
+
+                R = world_view_transform[:3, :3]
+                T = world_view_transform[:3, 3]
+                T = T / scale
+
+                R = R.transpose(0, 1)
+
+                return R, T
+
+            R, T = reWorldViewTransform(w2c, 1.0)
+
              # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
             xyz_cam = xyz @ R + T[None, :]
             
@@ -254,8 +305,9 @@ class GaussianModel:
         l_cam = [{'params': [self.P],'lr': training_args.rotation_lr * 0.01, "name": "pose"},]
         l += l_cam
 
-        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.optimizer = PerPointAdam(l, lr=0, betas=(0.9, 0.999), eps=1e-15, weight_decay=0.0)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.update_pose_until_iter = training_args.update_pose_until_iter
+        # self.optimizer = PerPointAdam(l, lr=0, betas=(0.9, 0.999), eps=1e-15, weight_decay=0.0)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -271,7 +323,10 @@ class GaussianModel:
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "pose":
-                lr = self.cam_scheduler_args(iteration)
+                if iteration > self.update_pose_until_iter:
+                    lr = 0
+                else:
+                    lr = self.cam_scheduler_args(iteration)
                 # print("pose learning rate", iteration, lr)
                 param_group['lr'] = lr
             if param_group["name"] == "xyz":
@@ -551,7 +606,7 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
-        grads = self.xyz_gradient_accum / self.denom
+        grads = self.xyz_gradient_accum / self.denom # 3Dgaussian的均值的累积梯度
         grads[grads.isnan()] = 0.0
 
         grads_abs = self.xyz_gradient_accum_abs / self.denom
@@ -560,20 +615,27 @@ class GaussianModel:
         Q = torch.quantile(grads_abs.reshape(-1), 1 - ratio)
         
         before = self._xyz.shape[0]
-        self.densify_and_clone(grads, max_grad, grads_abs, Q, extent)
+        self.densify_and_clone(grads, max_grad, grads_abs, Q, extent) # 如果某些3Dgaussian的均值的梯度过大且尺度小于一定阈值，说明是欠重建，则对它们进行克隆
         clone = self._xyz.shape[0]
-        self.densify_and_split(grads, max_grad, grads_abs, Q, extent)
+        self.densify_and_split(grads, max_grad, grads_abs, Q, extent) # 如果某些3Dgaussian的均值的梯度过大且尺度超过一定阈值，说明是过重建，则对它们进行切分
         split = self._xyz.shape[0]
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze() # 删除不透明度小于一定阈值的3Dgaussian
         if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+            big_points_vs = self.max_radii2D > max_screen_size # 删除2D半径超过2D尺寸阈值的高斯
+            self.prune_points(big_points_vs)
+            prune1 = self._xyz.shape[0]
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.5 * extent # 删除尺度超过一定阈值的高斯
+            # big_points_ws = self.get_scaling_with_3D_filter.max(dim=1).values > 0.1 * extent # 删除尺度超过一定阈值的高斯
+            self.prune_points(big_points_ws)
+            prune2 = self._xyz.shape[0]
+            print(f'split - prune1: {split - prune1}, prune1 - prune2: {prune1 - prune2}')
+            # prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        # self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
+        print(f'clone - before: {clone - before}, split - clone: {split - clone}')
         # torch.cuda.empty_cache()
-        return clone - before, split - clone, split - prune
+        # return clone - before, split - clone, split - prune
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

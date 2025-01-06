@@ -13,6 +13,21 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.pose_utils import get_camera_from_tensor
+
+
+def reWorldViewTransform(world_view_transform, scale):
+    world_view_transform = world_view_transform
+
+    R = world_view_transform[:3, :3]
+    T = world_view_transform[:3, 3]
+    T = T / scale
+
+    print('before:', R)
+    R = R.transpose(1, 0)
+    print('after:', R)
+
+    return R, T
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -60,6 +75,17 @@ class Camera(nn.Module):
         tan_fovy = np.tan(self.FoVy / 2.0)
         self.focal_y = self.image_height / (2.0 * tan_fovy)
         self.focal_x = self.image_width / (2.0 * tan_fovx)
+
+    def update_RT(self, pose):
+        w2c = get_camera_from_tensor(pose).cpu().detach().numpy()
+        R, T = reWorldViewTransform(w2c, 1.0)
+        self.R = R
+        self.T = T
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, self.trans, self.scale)).transpose(0, 1).cuda()
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+
          
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

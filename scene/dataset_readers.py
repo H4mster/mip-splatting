@@ -44,6 +44,7 @@ class SceneInfo(NamedTuple):
     ply_path: str
 
 def getNerfppNorm(cam_info):
+    # 计算这些相机的平均中心，以及到平均中心的最远距离，返回平均中心和最远距离
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)

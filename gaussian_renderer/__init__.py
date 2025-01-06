@@ -48,7 +48,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     projmatrix = (
         w2c.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0))
     ).squeeze(0)
-    camera_pos = w2c.inverse()[3, :3]
+    camera_pos = w2c.inverse()[3, :3] # (0, 0, 0)
 
     if subpixel_offset is None:
         subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
@@ -64,7 +64,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scale_modifier=scaling_modifier,
         # viewmatrix=viewpoint_camera.world_view_transform,
         # projmatrix=viewpoint_camera.full_proj_transform,
-        viewmatrix=w2c if update_pose else viewpoint_camera.world_view_transform,
+        viewmatrix=w2c if update_pose else viewpoint_camera.world_view_transform, # 相机已经在(0, 0, 0)了，所以w2c就用eye
         projmatrix=projmatrix if update_pose else viewpoint_camera.full_proj_transform,
         sh_degree=pc.active_sh_degree,
         # campos=viewpoint_camera.camera_center,
@@ -75,10 +75,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    if update_pose:
-        rel_w2c = get_camera_from_tensor(camera_pose)
+    if update_pose: # 把gaussian球移动到相机坐标系下
+        rel_w2c = get_camera_from_tensor(camera_pose) # optimized w2c
         gaussians_xyz = pc._xyz.clone()
-        gaussians_rot = pc._rotation.clone()
+        gaussians_rot = pc.get_rotation.clone()
         xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
         xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
         gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
@@ -100,6 +100,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc.get_scaling_with_3D_filter
         if update_pose:
             rotations = gaussians_rot_trans # pc.get_rotation
+            # rotations = pc.get_rotation
         else:
             rotations = pc.get_rotation
 

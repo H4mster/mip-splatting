@@ -56,6 +56,7 @@ class ModelParams(ParamGroup):
         self.eval = False
         self._kernel_size = 0.1
         # self.use_spatial_gaussian_bias = False
+        self.exp_name = "exp"
         self.ray_jitter = False
         self.resample_gt_image = False
         self.load_allres = False
@@ -77,6 +78,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        # self.iterations = 7_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -92,7 +94,8 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
-        self.update_pose_until_iter = 7_000
+        self.update_pose_until_iter = 30_000
+        self.use_pose_optimize = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

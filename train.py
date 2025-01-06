@@ -16,7 +16,11 @@ import cv2
 import torch
 import random
 from random import randint
+
+import torchvision
+
 from utils.loss_utils import l1_loss, ssim
+from fused_ssim import fused_ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -87,7 +91,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    pose = gaussians.get_RT(custom_cam.uid)
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer,
+                                       camera_pose=pose,
+                                       update_pose=opt.use_pose_optimize)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -130,7 +137,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             kernel_size=dataset.kernel_size,
                             subpixel_offset=subpixel_offset,
                             camera_pose=pose,
-                            update_pose=iteration < opt.update_pose_until_iter)
+                            update_pose=opt.use_pose_optimize)
         image, viewspace_point_tensor, visibility_filter, radii \
             = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -141,16 +148,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_image = create_offset_gt(gt_image, subpixel_offset)
 
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
         loss.backward()
 
         iter_end.record()
-        if iteration % 100 == 0:
-            for param_group in gaussians.optimizer.param_groups:
-                for param in param_group['params']:
-                    if param is gaussians.P:
-                        print(viewpoint_cam.uid, param.grad)
-                        break
+        # if iteration % 100 == 0:
+        #     for param_group in gaussians.optimizer.param_groups:
+        #         for param in param_group['params']:
+        #             if param is gaussians.P:
+        #                 print(viewpoint_cam.uid, param.grad)
+        #                 break
+        #     print("Gradient of self.P:", gaussians.P.grad)
+        if iteration % 1000 == 0:
+            print("P:\n", gaussians.P)
+            print("P - oriP:\n", gaussians.P - gaussians.oriP)
 
         with torch.no_grad():
             # Progress bar
@@ -162,10 +176,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+                print("\n[ITER {}] Saving new pose(image.txt)".format(iteration))
+                # np.save(os.path.join(args.model_path, 'ori_RT.npy'), gaussians.oriP.cpu().numpy())
+                # np.save(os.path.join(args.model_path, 'optim_RT.npy'), gaussians.P.cpu().numpy())
+                # 保存内参
+                from utils.colmap_util import save_extrinsic
+                from utils.pose_utils import get_camera_from_tensor, quadmultiply
+
+                sparse_path = args.model_path
+
+                sorted_trainCameras = sorted(trainCameras, key=lambda x: int(x.image_name))
+                extrinsics_w2c = [get_camera_from_tensor(gaussians.get_RT(camera.uid)).cpu().detach().numpy() for camera
+                                  in
+                                  sorted_trainCameras]
+                img_files = [camera.image_name for camera in sorted_trainCameras]
+
+                image_suffix = '.png'
+                save_extrinsic(sparse_path, extrinsics_w2c, img_files, image_suffix)
+
+
+                # 渲染所有camera
+                import imageio
+                def images_to_video(image_folder, output_video_path, fps=30):
+                    """
+                    Convert images in a folder to a video.
+
+                    Args:
+                    - image_folder (str): The path to the folder containing the images.
+                    - output_video_path (str): The path where the output video will be saved.
+                    - fps (int): Frames per second for the output video.
+                    """
+                    images = []
+
+                    for filename in sorted(os.listdir(image_folder)):
+                        if filename.endswith(('.png', '.jpg', '.jpeg', '.JPG', '.PNG')):
+                            image_path = os.path.join(image_folder, filename)
+                            image = imageio.imread(image_path)
+                            images.append(image)
+
+                    imageio.mimwrite(output_video_path, images, fps=fps)
+                image_path = os.path.join(args.model_path, f'renders/{iteration}/images/')
+                video_path = os.path.join(args.model_path, f'renders/{iteration}/video.mp4')
+                os.makedirs(image_path, exist_ok=True)
+                for camera in trainCameras:
+                    pose = gaussians.get_RT(camera.uid)
+                    rendering = render(camera, gaussians, pipe, background,
+                                   kernel_size=dataset.kernel_size,
+                                   subpixel_offset=subpixel_offset,
+                                   camera_pose=pose,
+                                   update_pose=opt.use_pose_optimize)["render"]
+                    torchvision.utils.save_image(
+                        rendering, os.path.join(image_path, "{0:05d}".format(int(camera.image_name)) + ".png")
+                    )
+                images_to_video(image_path, video_path, fps=12)
+
+            # for render test
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -175,6 +248,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # size_threshold = None # tmp: 避免点被删掉
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                     gaussians.compute_3D_filter(cameras=trainCameras)
 
@@ -185,15 +259,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration < opt.iterations - 100:
                     # don't update in the end of training
                     gaussians.compute_3D_filter(cameras=trainCameras)
-        
+
+            # stop pose optimize
+            # if opt.use_pose_optimize and iteration == opt.update_pose_until_iter:
+                # opt.use_pose_optimize = False
+                # print(f'opt.use_pose_optimize:{opt.use_pose_optimize}')
+                # for cam in trainCameras:
+                #     print('-' * 60)
+                #     print(cam.R)
+                #     cam.update_RT(gaussians.get_RT(cam.uid))
+                #     print('=' * 60)
+                #     print(cam.R)
+                #     print('-' * 60)
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            # for train
+            # if (iteration in checkpoint_iterations):
+            #     print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            #     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -212,7 +299,7 @@ def prepare_output_and_logger(args):
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(os.path.join(args.model_path, args.exp_name))
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
@@ -227,16 +314,26 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+                              # {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
+
+                              {'name': 'train',
+                               'cameras': scene.getTrainCameras()}
+                              )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    if config['name']=="train":
+                        pose = scene.gaussians.get_RT(viewpoint.uid)
+                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs,
+                                           camera_pose=pose,
+                                           update_pose=True)["render"], 0.0, 1.0)
+                    else:
+                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
+                    if tb_writer and (idx < 2):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
@@ -264,13 +361,17 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int,
+                        default=[500, 1_000, 1_500, 2_000, 2_500, 3_000, 7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    # parser.add_argument("--use_pose_optimize", action='store_true', default=False)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+
+    args.test_iterations = [i for i in range(500, 30_001, 500)]
     
     print("Optimizing " + args.model_path)
 

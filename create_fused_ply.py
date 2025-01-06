@@ -21,5 +21,6 @@ if __name__ == "__main__":
     gaussians = GaussianModel(dataset.sh_degree)
         
     gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", "iteration_30000", "point_cloud.ply"))
+    # gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", "iteration_7000", "point_cloud.ply"))
     gaussians.save_fused_ply(args.output_ply)
     
