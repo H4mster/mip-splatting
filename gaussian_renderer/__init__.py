@@ -21,7 +21,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
            override_color = None,
            subpixel_offset=None,
            camera_pose=None,
+           fov=None,
            update_pose=False, # 更新pose需要移动gaussians来达到获取梯度信息的目的，很慢，如果不更新pose就不需要更新了
+           update_fov=False
            ):
     """
     Render the scene. 
@@ -39,8 +41,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         pass
 
     # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    if fov is not None and update_fov:
+        fovx, fovy = fov
+        tanfovx = math.tan(fovx* 0.5)
+        tanfovy = math.tan(fovy * 0.5)
+    else:
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     # Set camera pose as identity. Then, we will transform the Gaussians around camera_pose
     # 如果我不修改高斯的位置呢？-> pose就没有梯度了

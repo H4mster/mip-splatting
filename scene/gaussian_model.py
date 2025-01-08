@@ -75,6 +75,8 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.P,
+            self.fovxs,
+            self.fovys,
         )
     
     def restore(self, model_args, training_args):
@@ -90,7 +92,9 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale,
-        self.P) = model_args
+        self.P,
+        self.fovxs,
+        self.fovys) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -186,9 +190,30 @@ class GaussianModel:
         self.P = poses.cuda().requires_grad_(True)
         self.oriP = self.P.clone().detach()
 
+    def init_intrinsic(self, cam_list):
+        fovxs = []
+        fovys = []
+        for cam in cam_list[1.0]:
+            print(f'cam: {cam}')
+            # print(f'cam.focal_x): {cam.focal_x}')
+            # print(f'cam.FoVx): {cam.FoVx}')
+            fovxs.append(torch.Tensor([cam.FoVx]))
+            fovys.append(torch.Tensor([cam.FoVy]))
+        fovxs = torch.stack(fovxs)
+        self.fovxs = fovxs.cuda().requires_grad_(True)
+        fovys = torch.stack(fovys)
+        self.fovys = fovys.cuda().requires_grad_(True)
+        self.ori_fovxs = self.fovxs.clone().detach()
+
+
     def get_RT(self, idx):
         pose = self.P[idx]
         return pose
+
+    def get_fov(self, idx):
+        fovx = self.fovxs[idx]
+        fovy = self.fovys[idx]
+        return fovx, fovy
 
     @torch.no_grad()
     def compute_3D_filter(self, cameras):
@@ -305,6 +330,10 @@ class GaussianModel:
         l_cam = [{'params': [self.P],'lr': training_args.rotation_lr * 0.01, "name": "pose"},]
         l += l_cam
 
+        l_fov = [{'params': [self.fovxs],'lr': training_args.rotation_lr * 0.01, "name": "fovx"},
+                 {'params': [self.fovys],'lr': training_args.rotation_lr * 0.01, "name": "fovy"}]
+        l += l_fov
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.update_pose_until_iter = training_args.update_pose_until_iter
         # self.optimizer = PerPointAdam(l, lr=0, betas=(0.9, 0.999), eps=1e-15, weight_decay=0.0)
@@ -322,7 +351,7 @@ class GaussianModel:
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "pose":
+            if param_group["name"] in ["pose", "fovx", "fovy"]:
                 if iteration > self.update_pose_until_iter:
                     lr = 0
                 else:
@@ -461,7 +490,7 @@ class GaussianModel:
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] == "pose":
+            if group["name"] in ["pose", "fovx", "fovy"]:
                 continue
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -478,7 +507,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if group["name"] == "pose":
+            if group["name"] in ["pose", "fovx", "fovy"]:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -516,7 +545,7 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            if group["name"] == "pose":
+            if group["name"] in ["pose", "fovx", "fovy"]:
                 continue
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)

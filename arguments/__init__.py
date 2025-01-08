@@ -96,6 +96,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.update_pose_until_iter = 30_000
         self.use_pose_optimize = False
+        self.use_fov_optimize = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

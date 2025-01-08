@@ -92,9 +92,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
                     pose = gaussians.get_RT(custom_cam.uid)
+                    fov = gaussians.get_fov(custom_cam.uid)
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer,
                                        camera_pose=pose,
-                                       update_pose=opt.use_pose_optimize)["render"]
+                                       fov=fov,
+                                       update_pose=opt.use_pose_optimize,
+                                       update_fov=opt.use_fov_optimize)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -118,6 +121,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         vind = viewpoint_indices.pop(rand_idx)
         pose = gaussians.get_RT(viewpoint_cam.uid)
+        fov = gaussians.get_fov(viewpoint_cam.uid)
         
         # Pick a random high resolution camera
         if random.random() < 0.3 and dataset.sample_more_highres:
@@ -137,7 +141,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             kernel_size=dataset.kernel_size,
                             subpixel_offset=subpixel_offset,
                             camera_pose=pose,
-                            update_pose=opt.use_pose_optimize)
+                            fov=fov,
+                            update_pose=opt.use_pose_optimize,
+                            update_fov=opt.use_fov_optimize)
         image, viewspace_point_tensor, visibility_filter, radii \
             = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -225,11 +231,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 os.makedirs(image_path, exist_ok=True)
                 for camera in trainCameras:
                     pose = gaussians.get_RT(camera.uid)
+                    fov = gaussians.get_fov(camera.uid)
                     rendering = render(camera, gaussians, pipe, background,
                                    kernel_size=dataset.kernel_size,
                                    subpixel_offset=subpixel_offset,
                                    camera_pose=pose,
-                                   update_pose=opt.use_pose_optimize)["render"]
+                                   fov=fov,
+                                   update_pose=opt.use_pose_optimize,
+                                   update_fov=opt.use_fov_optimize)["render"]
                     torchvision.utils.save_image(
                         rendering, os.path.join(image_path, "{0:05d}".format(int(camera.image_name)) + ".png")
                     )
@@ -244,7 +253,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, render_pkg["pixels"])
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -327,9 +336,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 for idx, viewpoint in enumerate(config['cameras']):
                     if config['name']=="train":
                         pose = scene.gaussians.get_RT(viewpoint.uid)
+                        fov = scene.gaussians.get_fov(viewpoint.uid)
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs,
                                            camera_pose=pose,
-                                           update_pose=True)["render"], 0.0, 1.0)
+                                           fov=fov,
+                                           update_pose=True,
+                                           update_fov=True)["render"], 0.0, 1.0)
                     else:
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
